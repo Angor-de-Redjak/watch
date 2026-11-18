@@ -46,6 +46,17 @@ var isSubFolder = function(path) {
 Watch.prototype._watchFromQueue = function() {
   var that = this;
 
+  // Si le dossier racine surveillé a été supprimé, on arrête tout proprement
+  if (this.watchPath && !fs.existsSync(this.watchPath)) {
+    this.emit("delete", {
+      eventType: "delete",
+      filename: this.watchPath,
+      stat: null,
+    });
+    this.close();
+    return;
+  }
+
   var events = this.events;
   this.events = [];
 
@@ -57,16 +68,24 @@ Watch.prototype._watchFromQueue = function() {
     var event = events[index];
 
     var file = that.filesystem.find(byName(event.filename));
-    var fileStat = (file) ? file.stat: null;
+    var fileStat = (file) ? file.stat : null;
     var fileExists = fs.existsSync(event.filename);
+    var currentStat = null;
 
-    if (!fileStat && fileExists) {
-      fileStat = fs.statSync(event.filename);
-      // devo cercarlo per ino se c'è è una move
+    if (fileExists) {
+      try {
+        currentStat = fs.statSync(event.filename);
+      } catch (err) {
+        // Le dossier/fichier a été supprimé juste entre existsSync et statSync
+        fileExists = false;
+      }
+    }
+
+    if (!fileStat && fileExists && currentStat) {
+      fileStat = currentStat;
       file = that.filesystem.find(byInode(fileStat.ino));
 
       if (file) {
-        // file move
         operations[fileStat.ino] = {
           eventType: "move",
           filename: event.filename,
@@ -74,8 +93,6 @@ Watch.prototype._watchFromQueue = function() {
           stat: fileStat,
         };
       } else {
-        // file nuovo
-        fileStat = fs.statSync(event.filename);
         operations[fileStat.ino] = {
           eventType: "create",
           filename: event.filename,
@@ -147,6 +164,12 @@ Watch.prototype._watchFromQueue = function() {
 Watch.prototype.watch = function(watchPath) {
 
   var that = this;
+  this.watchPath = watchPath;
+
+  if (!fs.existsSync(watchPath)) {
+    this.emit("error", new Error("Watch path does not exist: " + watchPath));
+    return this;
+  }
   var walker = walk.walk(watchPath, {followLinks: this.options.followLinks});
 
   walker.on('directory', function(root, stat, next) {
@@ -164,6 +187,11 @@ Watch.prototype.watch = function(watchPath) {
       fullpath: path.join(root, stat.name),
       stat: stat,
     });
+    next();
+  });
+
+  // Éviter le crash si un sous-dossier est supprimé pendant le scan initial
+  walker.on('errors', function(root, nodeStatsArray, next) {
     next();
   });
 
@@ -196,6 +224,20 @@ Watch.prototype.watch = function(watchPath) {
 
         // start check timeout
         that.eventWatcherId = setTimeout(that._watchFromQueue.bind(that), that.options.every);
+      }
+    });
+    
+    that.watcher.on('error', function(err) {
+      // Sur Windows/Linux, supprimer le dossier racine déclenche souvent EPERM ou ENOENT
+      if (err.code === 'EPERM' || err.code === 'ENOENT') {
+        that.emit("delete", {
+          eventType: "delete",
+          filename: watchPath,
+          stat: null,
+        });
+        that.close();
+      } else {
+        that.emit("error", err);
       }
     });
 
